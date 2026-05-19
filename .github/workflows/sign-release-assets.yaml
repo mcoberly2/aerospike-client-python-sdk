@@ -1,0 +1,144 @@
+# Signs published wheel/sdist with Aerospike shared-workflows (GPG detached .asc),
+# writes SHA256 sidecars, GPG-signs those .sha256 files, then uploads everything
+# to the *existing* GitHub release for the given tag.
+#
+# Prerequisites (repository secrets — map to your org’s naming if different):
+#   GPG_PRIVATE_KEY   ASCII-armored or base64 private key
+#   GPG_PUBLIC_KEY    ASCII-armored or base64 public key
+#   GPG_PASS          Key passphrase
+#
+# Pinning: `sign-packages` uses reusable_sign-artifacts@main; keep `gh-workflows-ref`
+# identical to that ref (see shared-workflows docs). For stricter supply-chain control,
+# change both the @ref on `uses:` and `gh-workflows-ref` to the same commit SHA or tag.
+
+name: Sign release assets and upload checksums
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag (e.g. v0.9.0-alpha.1)'
+        required: true
+        type: string
+      wheel_asset:
+        description: 'Wheel filename attached to that release'
+        required: false
+        default: 'aerospike_sdk-0.9.0a1-py3-none-any.whl'
+        type: string
+      sdist_asset:
+        description: 'Sdist tarball filename attached to that release'
+        required: false
+        default: 'aerospike_sdk-0.9.0a1.tar.gz'
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Harden the runner (audit outbound calls)
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: audit
+
+      - name: Download release assets and write SHA256 sidecars
+        env:
+          TAG: ${{ inputs.tag }}
+          WHEEL: ${{ inputs.wheel_asset }}
+          SDIST: ${{ inputs.sdist_asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p unsigned-artifacts
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          curl -fL --retry 3 --retry-delay 2 -o "unsigned-artifacts/${WHEEL}" "${base}/${WHEEL}"
+          curl -fL --retry 3 --retry-delay 2 -o "unsigned-artifacts/${SDIST}" "${base}/${SDIST}"
+          cd unsigned-artifacts
+          for f in "${WHEEL}" "${SDIST}"; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+
+      - name: Upload unsigned bundle for signing
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-artifacts
+          path: unsigned-artifacts/
+          overwrite: true
+          retention-days: 7
+
+  sign-packages:
+    needs: prepare
+    # GitHub requires a literal ref here (no expressions). Keep in sync with gh-workflows-ref.
+    uses: aerospike/shared-workflows/.github/workflows/reusable_sign-artifacts.yaml@main
+    secrets:
+      gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+      gpg-public-key: ${{ secrets.GPG_PUBLIC_KEY }}
+      gpg-key-pass: ${{ secrets.GPG_PASS }}
+    with:
+      gh-workflows-ref: main
+      gh-unsigned-artifacts: build-artifacts
+      gh-artifact-name: signed-release-assets
+      gh-checkout-path: shared-workflows
+      gh-retention-days: 7
+
+  upload-to-release:
+    needs: sign-packages
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Harden the runner (audit outbound calls)
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: audit
+
+      - name: Download signed artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.sign-packages.outputs.gh-artifact-name }}
+          path: signed-layout
+          merge-multiple: true
+
+      - name: Set up GPG (sign .sha256 files; shared sign-artifacts entrypoint skips them)
+        uses: aerospike/shared-workflows/.github/actions/setup-gpg@f6bb565e7d31fa3013a1a75c5f80aed44c3bde5c # v3.4.1
+        with:
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-public-key: ${{ secrets.GPG_PUBLIC_KEY }}
+          gpg-key-pass: ${{ secrets.GPG_PASS }}
+
+      - name: Detached-sign SHA256 checksum files
+        env:
+          HOME: /home/runner
+          GNUPGHOME: /home/runner/.gnupg
+          GPG_TTY: /dev/null
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' f; do
+            gpg --detach-sign --no-tty --batch --yes --quiet \
+              --passphrase-file "$GNUPGHOME/passphrase" \
+              --output "${f}.asc" \
+              "$f"
+          done < <(find signed-layout -type f -name '*.sha256' -print0)
+
+      - name: Upload assets to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(
+            find signed-layout -type f \( \
+              -name '*.whl' -o \
+              -name '*.tar.gz' -o \
+              -name '*.sha256' -o \
+              -name '*.asc' \
+            \) | LC_ALL=C sort
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No files matched for upload under signed-layout/" >&2
+            find signed-layout -ls || true
+            exit 1
+          fi
+          printf 'Uploading %s files to release %s:\n' "${#files[@]}" "$TAG"
+          printf ' %s\n' "${files[@]}"
+          gh release upload "$TAG" "${files[@]}" --clobber
