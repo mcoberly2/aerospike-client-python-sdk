@@ -123,6 +123,8 @@ jobs:
       - name: Upload assets to the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          # gh defaults to inferring repo from git; this job has no checkout, so set explicitly.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
